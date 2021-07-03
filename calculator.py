@@ -1,32 +1,17 @@
-#   Overview
+#   Overview of program
 #
-# read in history from csv
-# convert into some internal data structre of trades
-#
-# go through all trades (in datetime order) where sell currency is not base fiat currency (GBP or EUR)
-#
-#    work out profit on that trade
-#       determine whether to use FIFO or average
-#
-#
-#
-# add up profits
-#
-# work out final taxable amount
-#
-# output results
+# - read in trade history from csv
+# - converts into some internal data structure of trades
+# - goes through all trades (in datetime order) where sell currency is not base fiat currency (GBP)
+# - work out profit/gain on each trade while determining whether to use FIFO or average
+# - add up profits and work out final taxable amount
+# - output results
 #
 
 # Assumptions
 #   * All dates are UTC
 
-# Test Ideas
-#   * Badly formatted CSV => errors
-#   * Random date order CSV => chronological order
-#   * correct date order CSV => chronological order
-#   * gifts
-#   * disposal with no corresponding buy --- should be costbasis of 0
-#   * A BnB check with edge cases (29 days, 30 days, 31 days)
+
 
 import json
 import sys
@@ -40,7 +25,7 @@ from typing import List, Optional
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
 
-# TODO: Have config option of logging location
+# TODO: Have config option of logging trade location
 handler = logging.StreamHandler(sys.stdout)
 logger.addHandler(handler)
 
@@ -56,8 +41,8 @@ class GainType(Enum):
     UNACCOUNTED = 5
 
 
-# TODO: Load these better
 class TradeColumn(IntEnum):
+    # Load the indices of variables in the trading csv
     TRADE_TYPE = configs["TRADE_CSV_INDICES"]["TRADE_TYPE"]
     BUY_AMOUNT = configs["TRADE_CSV_INDICES"]["BUY_AMOUNT"]
     BUY_CURRENCY = configs["TRADE_CSV_INDICES"]["BUY_CURRENCY"]
@@ -72,8 +57,8 @@ class TradeColumn(IntEnum):
     DATE = configs["TRADE_CSV_INDICES"]["DATE"]
 
 
-# TODO: Load these better
 class FeeColumn(IntEnum):
+    # Load the indices of variables in the fee csv
     TRADE_TYPE = configs["FEE_CSV_INDICES"]["TRADE_TYPE"]
     FEE_AMOUNT = configs["FEE_CSV_INDICES"]["FEE_AMOUNT"]
     FEE_CURRENCY = configs["FEE_CSV_INDICES"]["FEE_CURRENCY"]
@@ -95,6 +80,8 @@ NATIVE_CURRENCY = configs["NATIVE_CURRENCY"]
 TAX_YEAR = configs["TAX_YEAR"]
 TRADE_CSV = configs["TRADE_CSV"]
 FEE_CSV = configs["FEE_CSV"]
+# Choose whether to merge similar trades from the same day (improves readability)
+MERGE_SAME_DAY_TRADES = True
 
 
 class Trade:
@@ -167,6 +154,9 @@ class Trade:
     def is_possible_duplicate(self, trade):
         return self.buy_amount == trade.buy_amount and self.buy_currency == trade.buy_currency and self.buy_value_gbp == trade.buy_value_gbp and self.sell_amount == trade.sell_amount and self.sell_currency == trade.sell_currency and self.sell_value_gbp == trade.sell_value_gbp and self.date == trade.date and self.exchange == trade.exchange
 
+    def can_be_merged(self, trade):
+        return self.buy_currency == trade.buy_currency and self.sell_currency == trade.sell_currency and self.date.date() == trade.date.date() and self.exchange == trade.exchange and self.native_cost_per_coin == trade.native_cost_per_coin and self.native_value_per_coin == trade.native_value_per_coin
+
     def __repr__(self):
         return f"<Trade {self.date} :: {self.buy_amount} {self.buy_currency} ({self.buy_value_gbp} GBP) <- " \
                f"{self.sell_amount} {self.sell_currency} ({self.sell_value_gbp} GBP)>"
@@ -208,12 +198,14 @@ class Fee:
                    datetime.strptime(row[FeeColumn.DATE], DATE_FORMAT),
                    row[FeeColumn.EXCHANGE])
 
+    def can_be_merged(self, fee):
+        return self.fee_currency == fee.fee_currency and self.date.date() == fee.date.date() and self.exchange == fee.exchange
+
     def __repr__(self):
         return f"<Fee {self.date} :: {self.fee_amount} {self.fee_currency}"
 
 
 class Gain:
-
     heading = "<th>Date Sold</th>" \
               "<th>Match Type</th>" \
               "<th>Currency</th>" \
@@ -253,7 +245,6 @@ class Gain:
         if self.disposal_trade.sell_currency != NATIVE_CURRENCY:
 
             if disposal.fee is not None:
-
                 self.fee_value_gbp = disposal.fee.fee_value_gbp_at_trade * proportion_accounted_for
 
             self.native_currency_gain_value -= self.fee_value_gbp
@@ -307,6 +298,62 @@ class Gain:
                 self.fee_value_gbp) + " Gain/Loss in GBP: " + str(self.native_currency_gain_value)
 
 
+def merge_trades_from_same_day(trades: List[Trade]):
+    if any(t.buy_currency != trades[0].buy_currency for t in trades):
+        raise ValueError('Merging different trades')
+    if any(t.sell_currency != trades[0].sell_currency for t in trades):
+        raise ValueError('Merging different trades')
+    if any(t.date.date() != trades[0].date.date() for t in trades):
+        raise ValueError('Merging different trades')
+    if any(t.exchange != trades[0].exchange for t in trades):
+        raise ValueError('Merging different trades')
+
+    buy_currency = trades[0].buy_currency
+    date = trades[0].date
+    exchange = trades[0].exchange
+
+    buy_amount = sum([t.buy_amount for t in trades])
+    buy_value_gbp = sum([t.buy_value_gbp for t in trades])
+    sell_amount = sum([t.sell_amount for t in trades])
+    sell_currency = trades[0].sell_currency
+    sell_value_gbp = sum([t.sell_value_gbp for t in trades])
+
+    merged_trade = Trade(buy_amount, buy_currency, buy_value_gbp, sell_amount, sell_currency, sell_value_gbp, date,
+                         exchange)
+
+    return merged_trade
+
+
+def merge_fees_from_same_day(fees: List[Fee]):
+    if any(t.fee_currency != fees[0].fee_currency for t in fees):
+        raise ValueError('Merging different fees')
+    if any(t.date.date() != fees[0].date.date() for t in fees):
+        raise ValueError('Merging different fees')
+    if any(t.exchange != fees[0].exchange for t in fees):
+        raise ValueError('Merging different fees')
+    if any(t.trade_buy_currency != fees[0].trade_buy_currency for t in fees):
+        raise ValueError('Merging different fees')
+    if any(t.trade_sell_currency != fees[0].trade_sell_currency for t in fees):
+        raise ValueError('Merging different fees')
+
+    fee_currency = fees[0].fee_currency
+    trade_buy_currency = fees[0].trade_buy_currency
+    trade_sell_currency = fees[0].trade_sell_currency
+    date = fees[0].date
+    exchange = fees[0].exchange
+
+    fee_amount = sum([t.fee_amount for t in fees])
+    fee_value_gbp_at_trade = sum([t.fee_value_gbp_at_trade for t in fees])
+    fee_value_gbp_now = sum([t.fee_value_gbp_now for t in fees])
+    trade_buy_amount = sum([t.trade_buy_amount for t in fees])
+    trade_sell_amount = sum([t.trade_sell_amount for t in fees])
+
+    merged_fee = Fee(fee_amount, fee_currency, fee_value_gbp_at_trade, fee_value_gbp_now, trade_buy_amount,
+                     trade_buy_currency, trade_sell_amount, trade_sell_currency, date, exchange)
+
+    return merged_fee
+
+
 def read_csv_into_trade_list(csv_filename):
     try:
         with open(csv_filename, encoding='utf-8') as csv_file:
@@ -323,6 +370,17 @@ def read_csv_into_trade_list(csv_filename):
                  trade.is_possible_duplicate(trade2) and trades.index(trade2) != i]
 
             logger.debug(f"Loaded {len(trades)} trades from {csv_filename}.")
+            if MERGE_SAME_DAY_TRADES:
+                new_trades = []
+                already_merged_trades = []
+                for t in trades:
+                    if t not in already_merged_trades:
+                        trades_to_merge = [same_day_trade for same_day_trade in trades if
+                                           t.can_be_merged(same_day_trade)]
+                        already_merged_trades.extend(trades_to_merge)
+                        new_trades.append(merge_trades_from_same_day(trades_to_merge))
+
+                trades = new_trades
             return trades
     except FileNotFoundError as e:
         logger.error(f"Could not find fees csv: '{csv_filename}'.")
@@ -347,8 +405,21 @@ def read_csv_into_fee_list(csv_filename):
                 [logger.warning(f"FEE Warning - Possible Duplicates:{fee} and {fee2}.") for fee2 in fees if
                  fee.is_possible_duplicate(fee2) and fees.index(fee2) != i]
 
-            [logger.warning(f"FEE Warning - Unusual large fee amount of {fee.fee_value_gbp_at_trade} in fee: {fee}") for fee in fees
+            [logger.warning(f"FEE Warning - Unusual large fee amount of {fee.fee_value_gbp_at_trade} in fee: {fee}") for
+             fee in fees
              if fee.fee_value_gbp_at_trade > 20]
+
+            if MERGE_SAME_DAY_TRADES:
+                new_fees = []
+                already_merged_fees = []
+                for t in fees:
+                    if t not in already_merged_fees:
+                        fees_to_merge = [same_day_fee for same_day_fee in fees if
+                                         t.can_be_merged(same_day_fee)]
+                        already_merged_fees.extend(fees_to_merge)
+                        new_fees.append(merge_fees_from_same_day(fees_to_merge))
+
+                fees = new_fees
 
             return fees
     except FileNotFoundError as e:
@@ -516,6 +587,7 @@ def calculate_capital_gain(trade_list: List[Trade]):
 #         gain_writer = csv.writer(csvfile)
 #         gain_writer.writerow(f"Gains calculated for {TAX_YEAR_START}/{TAX_YEAR_END}")
 
+
 def output_to_html(gains: List[Gain], template_file, html_output_filename):
     relevant_capital_gains = [g for g in gains if within_tax_year(g.disposal_trade, TAX_YEAR)]
     relevant_capital_gains.sort(key=lambda g: g.date_sold, reverse=True)
@@ -551,12 +623,17 @@ def output_to_html(gains: List[Gain], template_file, html_output_filename):
         gains_string += (gain.html_format())
     STYLE = "<style> table {border-collapse: collapse;}" \
             "td,th {padding: 1px;border-style: solid; border-width:thin;}</style>"
+    if MERGE_SAME_DAY_TRADES:
+        num_disposals = str(
+            len(relevant_trades)) + " (Matching disposals occurring on the same day are grouped for readability)"
+    else:
+        num_disposals = len(relevant_trades)
     out = contents.format(STYLE=STYLE,
                           TAX_YEAR_START=TAX_YEAR - 1,
                           TAX_YEAR_END=TAX_YEAR,
                           NATIVE_CURRENCY=NATIVE_CURRENCY,
                           INPUT_TRADE_CSV=TRADE_CSV,
-                          NUMBER_OF_DISPOSALS=len(relevant_trades),
+                          NUMBER_OF_DISPOSALS=num_disposals,
                           DAY_GAINS=day_gain_sum,
                           BNB_GAINS=bnb_gain_sum,
                           AVG_GAINS=avg_gain_sum,
@@ -582,6 +659,7 @@ def main():
     total_gains = calculate_capital_gain(trades)
 
     output_to_html(total_gains, "output_template.html", "tax-report.html")
+
 
 if __name__ == "__main__":
     main()
